@@ -29,6 +29,7 @@ __author__ = 'ElDavo'
 __copyright__ = 'Copyright (C) 2023'
 __license__ = 'GPLv3'
 __status__ = 'Production'
+__version__ = '6.1'
 
 def parsecmdline() -> argparse.Namespace:
     """Sets up the argument parser"""
@@ -91,6 +92,56 @@ def find_data_offset(logger, header: bytes, iv_offset: int, key: bytes, starting
                     return i
     return -1
 
+
+def guess_offsets(logger, key: bytes, file_hash, encrypted: io.BufferedReader, def_iv_offset: int,
+                  def_data_offset: int):
+    """Gets the IV, shifts the stream to the beginning of the encrypted data and returns the cipher.
+    It does so by guessing the offset."""
+
+    # Assign variables to suppress warnings
+    db_header, data_offset, iv_offset = None, None, None
+
+    # Restart the file stream
+    encrypted.seek(0)
+
+    db_header = encrypted.read(HEADER_SIZE)
+    if len(db_header) < HEADER_SIZE:
+        logger.f("The encrypted database is too small.\n    "
+                 "Did you swap the keyfile and the encrypted database file by mistake?")
+
+    try:
+        if db_header[:15].decode('ascii') == 'SQLite format 3':
+            logger.e("The database file is not encrypted.\n    "
+                     "Did you swap the input and the output files by mistake?")
+    except ValueError:
+        pass
+
+    # Finding WhatsApp's version is nice
+    version = findall(b"\\d(?:\\.\\d{1,3}){3}", db_header)
+    if len(version) != 1:
+        logger.i('WhatsApp version not found (Crypt12?)')
+    else:
+        logger.v("WhatsApp version: {}".format(version[0].decode('ascii')))
+
+    # Determine IV offset and data offset.
+    for iv_offset in oscillate(n=def_iv_offset, n_min=0, n_max=HEADER_SIZE - 128):
+        data_offset = find_data_offset(logger, db_header, iv_offset, key, def_data_offset)
+        if data_offset != -1:
+            logger.i("Offsets guessed (IV: {}, data: {}).".format(iv_offset, data_offset))
+            if iv_offset != def_iv_offset or data_offset != def_data_offset:
+                logger.i("Next time, use -ivo {} -do {} for guess-free decryption".format(iv_offset, data_offset))
+            break
+    if data_offset == -1:
+        return None
+
+    iv = db_header[iv_offset:iv_offset + 16]
+
+    encrypted.seek(data_offset)
+
+    file_hash.update(db_header[:data_offset])
+
+    return AES.new(key, AES.MODE_GCM, iv)
+
 def check_crypt12(logger, file_hash, key, encrypted):
     """Checks if the file is a Crypt12 file.
     Returns the cipher if it is, None otherwise."""
@@ -144,55 +195,6 @@ def check_crypt12(logger, file_hash, key, encrypted):
     # We are done here
     logger.i("Database header parsed")
     return AES.new(key.key, AES.MODE_GCM, iv)
-
-def guess_offsets(logger, key: bytes, file_hash, encrypted: io.BufferedReader, def_iv_offset: int,
-                  def_data_offset: int):
-    """Gets the IV, shifts the stream to the beginning of the encrypted data and returns the cipher.
-    It does so by guessing the offset."""
-
-    # Assign variables to suppress warnings
-    db_header, data_offset, iv_offset = None, None, None
-
-    # Restart the file stream
-    encrypted.seek(0)
-
-    db_header = encrypted.read(HEADER_SIZE)
-    if len(db_header) < HEADER_SIZE:
-        logger.f("The encrypted database is too small.\n    "
-                 "Did you swap the keyfile and the encrypted database file by mistake?")
-
-    try:
-        if db_header[:15].decode('ascii') == 'SQLite format 3':
-            logger.e("The database file is not encrypted.\n    "
-                     "Did you swap the input and the output files by mistake?")
-    except ValueError:
-        pass
-
-    # Finding WhatsApp's version is nice
-    version = findall(b"\\d(?:\\.\\d{1,3}){3}", db_header)
-    if len(version) != 1:
-        logger.i('WhatsApp version not found (Crypt12?)')
-    else:
-        logger.v("WhatsApp version: {}".format(version[0].decode('ascii')))
-
-    # Determine IV offset and data offset.
-    for iv_offset in oscillate(n=def_iv_offset, n_min=0, n_max=HEADER_SIZE - 128):
-        data_offset = find_data_offset(logger, db_header, iv_offset, key, def_data_offset)
-        if data_offset != -1:
-            logger.i("Offsets guessed (IV: {}, data: {}).".format(iv_offset, data_offset))
-            if iv_offset != def_iv_offset or data_offset != def_data_offset:
-                logger.i("Next time, use -ivo {} -do {} for guess-free decryption".format(iv_offset, data_offset))
-            break
-    if data_offset == -1:
-        return None
-
-    iv = db_header[iv_offset:iv_offset + 16]
-
-    encrypted.seek(data_offset)
-
-    file_hash.update(db_header[:data_offset])
-
-    return AES.new(key, AES.MODE_GCM, iv)
 
 def parse_protobuf(logger, file_hash, key: Key, encrypted):
     """Parses the database header, gets the IV,
